@@ -138,14 +138,14 @@ pip install pyinstaller
 Build the standalone app, portable ZIP, and setup EXE:
 
 ```powershell
-.\scripts\package_release.ps1 -Version 0.2.6
+.\scripts\package_release.ps1 -Version 1.0.0
 ```
 
 Outputs:
 
 - `dist\NoxLab Share.exe` standalone app
-- `release\NoxLabShare-0.2.6-windows.zip` portable release
-- `release\NoxLabShare-0.2.6-Setup.exe` per-user setup installer
+- `release\NoxLabShare-1.0.0-windows.zip` portable release
+- `release\NoxLabShare-1.0.0-Setup.exe` per-user setup installer
 
 The setup installer copies the app to:
 
