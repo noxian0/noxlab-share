@@ -34,8 +34,26 @@ This MVP uses Python because it gives a small, inspectable Windows app without a
 
 ## Requirements
 
+For normal users installing the release:
+
 - Windows 10 or newer
-- Python 3.11+ recommended
+- No Python required when using the setup EXE or portable release ZIP
+- Devices must be on the same Wi-Fi/LAN
+- Windows Firewall may ask you to allow NoxLab Share on Private networks
+
+For running from source:
+
+- Windows 10 or newer
+- Python 3.11+ recommended, with `pip`
+- Tkinter/Tcl-Tk support, included with the standard Python installer from python.org
+- Python packages from `requirements.txt`: `qrcode[pil]` and `Pillow`
+- PowerShell for the helper scripts
+
+For building a Windows release:
+
+- Everything needed to run from source
+- PyInstaller, installed with `pip install pyinstaller`
+- PowerShell and standard Windows .NET components for the setup builder
 
 ## Run locally
 
