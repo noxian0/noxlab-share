@@ -1,5 +1,6 @@
 param(
-    [string]$Version = "0.1.0"
+    [string]$Version = "0.1.0",
+    [switch]$BuildSetup
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,35 +58,39 @@ if (Test-Path $zipPath) {
 Compress-Archive -Path (Join-Path $payloadDir "*") -DestinationPath $zipPath
 Write-Host "Portable release ZIP created: $zipPath"
 
-$setupStubSource = Join-Path $projectDir "scripts\setup_stub.cs"
-$setupStubPath = Join-Path $releaseDir "NoxLabShareSetupStub.exe"
+if ($BuildSetup) {
+    $setupStubSource = Join-Path $projectDir "scripts\setup_stub.cs"
+    $setupStubPath = Join-Path $releaseDir "NoxLabShareSetupStub.exe"
 
-if (Test-Path $setupStubPath) {
+    if (Test-Path $setupStubPath) {
+        Remove-Item -LiteralPath $setupStubPath -Force
+    }
+    if (Test-Path $setupPath) {
+        Remove-Item -LiteralPath $setupPath -Force
+    }
+
+    $setupStubCode = Get-Content -LiteralPath $setupStubSource -Raw
+    Add-Type `
+        -TypeDefinition $setupStubCode `
+        -ReferencedAssemblies @("System.Windows.Forms.dll", "System.IO.Compression.dll", "System.IO.Compression.FileSystem.dll") `
+        -OutputAssembly $setupStubPath `
+        -OutputType WindowsApplication
+
+    $marker = [System.Text.Encoding]::ASCII.GetBytes("`n--NOXLAB-SHARE-PAYLOAD-V1--`n")
+    [byte[]]$stubBytes = [System.IO.File]::ReadAllBytes($setupStubPath)
+    [byte[]]$zipBytes = [System.IO.File]::ReadAllBytes($zipPath)
+
+    $output = [System.IO.File]::Create($setupPath)
+    try {
+        $output.Write($stubBytes, 0, $stubBytes.Length)
+        $output.Write($marker, 0, $marker.Length)
+        $output.Write($zipBytes, 0, $zipBytes.Length)
+    } finally {
+        $output.Dispose()
+    }
+
     Remove-Item -LiteralPath $setupStubPath -Force
+    Write-Host "Unsigned setup installer created: $setupPath"
+} else {
+    Write-Host "Setup installer skipped. Use -BuildSetup to create the unsigned setup EXE."
 }
-if (Test-Path $setupPath) {
-    Remove-Item -LiteralPath $setupPath -Force
-}
-
-$setupStubCode = Get-Content -LiteralPath $setupStubSource -Raw
-Add-Type `
-    -TypeDefinition $setupStubCode `
-    -ReferencedAssemblies @("System.Windows.Forms.dll", "System.IO.Compression.dll", "System.IO.Compression.FileSystem.dll") `
-    -OutputAssembly $setupStubPath `
-    -OutputType WindowsApplication
-
-$marker = [System.Text.Encoding]::ASCII.GetBytes("`n--NOXLAB-SHARE-PAYLOAD-V1--`n")
-[byte[]]$stubBytes = [System.IO.File]::ReadAllBytes($setupStubPath)
-[byte[]]$zipBytes = [System.IO.File]::ReadAllBytes($zipPath)
-
-$output = [System.IO.File]::Create($setupPath)
-try {
-    $output.Write($stubBytes, 0, $stubBytes.Length)
-    $output.Write($marker, 0, $marker.Length)
-    $output.Write($zipBytes, 0, $zipBytes.Length)
-} finally {
-    $output.Dispose()
-}
-
-Remove-Item -LiteralPath $setupStubPath -Force
-Write-Host "Setup installer created: $setupPath"

@@ -37,7 +37,7 @@ This MVP uses Python because it gives a small, inspectable Windows app without a
 For normal users installing the release:
 
 - Windows 10 or newer
-- No Python required when using the setup EXE or portable release ZIP
+- No Python required when using the portable release ZIP
 - Devices must be on the same Wi-Fi/LAN
 - Windows Firewall may ask you to allow NoxLab Share on Private networks
 
@@ -54,6 +54,18 @@ For building a Windows release:
 - Everything needed to run from source
 - PyInstaller, installed with `pip install pyinstaller`
 - PowerShell and standard Windows .NET components for the setup builder
+
+## Download from GitHub
+
+Download `NoxLabShare-1.0.0-windows.zip` from the latest GitHub Release.
+
+The ZIP includes:
+
+- `NoxLab Share.exe` to run the app directly
+- `Install.cmd` to install it to `%LOCALAPPDATA%\Programs\NoxLab Share`
+- `README.md`, `LICENSE`, and the app icon
+
+The setup EXE is not published by default because unsigned self-extracting installers are commonly blocked by browsers or antivirus tools. The portable ZIP is the recommended release format until the app has a signed installer.
 
 ## Run locally
 
@@ -153,7 +165,7 @@ Install packaging tools:
 pip install pyinstaller
 ```
 
-Build the standalone app, portable ZIP, and setup EXE:
+Build the standalone app and portable ZIP:
 
 ```powershell
 .\scripts\package_release.ps1 -Version 1.0.0
@@ -163,15 +175,22 @@ Outputs:
 
 - `dist\NoxLab Share.exe` standalone app
 - `release\NoxLabShare-1.0.0-windows.zip` portable release
-- `release\NoxLabShare-1.0.0-Setup.exe` per-user setup installer
 
-The setup installer copies the app to:
+The portable ZIP includes `Install.cmd`, which copies the app to:
 
 ```text
 %LOCALAPPDATA%\Programs\NoxLab Share
 ```
 
-It also creates Desktop and Start Menu shortcuts.
+It also creates Desktop, Start Menu, and in-folder shortcuts.
+
+To build the unsigned setup EXE for local testing, pass `-BuildSetup`:
+
+```powershell
+.\scripts\package_release.ps1 -Version 1.0.0 -BuildSetup
+```
+
+Do not publish the unsigned setup EXE unless you expect browser or antivirus warnings.
 
 ## Development notes
 
