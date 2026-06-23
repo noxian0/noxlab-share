@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import queue
 import os
 import platform
@@ -65,6 +66,7 @@ class NoxLabShareApp(tk.Tk):
         self._configure_window_size()
         self.configure(bg=BG)
         self._set_window_icon()
+        self._apply_dark_title_bar()
 
         self.selected_path: Path | None = None
         self.selected_is_folder = False
@@ -120,6 +122,7 @@ class NoxLabShareApp(tk.Tk):
             return
         try:
             self.state("zoomed")
+            self._apply_dark_title_bar()
         except tk.TclError:
             pass
 
@@ -130,6 +133,46 @@ class NoxLabShareApp(tk.Tk):
                 self.iconbitmap(default=str(icon_path))
             except tk.TclError:
                 pass
+
+    def _apply_dark_title_bar(self) -> None:
+        if platform.system() != "Windows":
+            return
+
+        try:
+            self.update_idletasks()
+            hwnd = self.winfo_id()
+            dwmapi = ctypes.windll.dwmapi
+
+            dark_mode = ctypes.c_int(1)
+            for attribute in (20, 19):
+                result = dwmapi.DwmSetWindowAttribute(
+                    hwnd,
+                    attribute,
+                    ctypes.byref(dark_mode),
+                    ctypes.sizeof(dark_mode),
+                )
+                if result == 0:
+                    break
+
+            border = ctypes.c_int(self._colorref(BORDER))
+            caption = ctypes.c_int(self._colorref(PANEL))
+            text = ctypes.c_int(self._colorref(TEXT))
+            for attribute, value in ((34, border), (35, caption), (36, text)):
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd,
+                    attribute,
+                    ctypes.byref(value),
+                    ctypes.sizeof(value),
+                )
+        except (AttributeError, OSError, tk.TclError):
+            pass
+
+    @staticmethod
+    def _colorref(hex_color: str) -> int:
+        red = int(hex_color[1:3], 16)
+        green = int(hex_color[3:5], 16)
+        blue = int(hex_color[5:7], 16)
+        return red | (green << 8) | (blue << 16)
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
