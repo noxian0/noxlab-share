@@ -25,6 +25,7 @@ No cloud upload. No account system. No tunneling service.
 - Receive files from a phone through a LAN upload page
 - Choose the PC folder where received files are saved
 - Choose a receive upload limit: 512 MB, 2 GB, 5 GB, 10 GB, or no fixed limit
+- Sender status shows the other device's LAN IP and time when it receives the final download byte
 - Lightweight activity log
 - Temporary ZIP cleanup when sharing stops or the app exits
 
@@ -57,7 +58,7 @@ For building a Windows release:
 
 ## Download from GitHub
 
-Download `NoxLabShare-1.0.1-windows.zip` from the latest GitHub Release.
+Download `NoxLabShare-1.0.2-windows.zip` from the latest GitHub Release.
 
 The ZIP includes:
 
@@ -95,7 +96,8 @@ This creates `NoxLab Share.lnk` on your Desktop and `Open NoxLab Share.lnk` insi
 3. Choose an auto-stop timer or leave it on Manual.
 4. Click **Start Sharing**.
 5. Open the LAN URL on another device or scan the QR code.
-6. Click **Stop** when finished.
+6. The sender app's **Last download** status shows the device IP and time when the transfer finishes.
+7. Click **Stop** when finished.
 
 ## Receive files from phone
 
@@ -168,13 +170,13 @@ pip install pyinstaller
 Build the standalone app and portable ZIP:
 
 ```powershell
-.\scripts\package_release.ps1 -Version 1.0.1
+.\scripts\package_release.ps1 -Version 1.0.2
 ```
 
 Outputs:
 
 - `dist\NoxLab Share.exe` standalone app
-- `release\NoxLabShare-1.0.1-windows.zip` portable release
+- `release\NoxLabShare-1.0.2-windows.zip` portable release
 
 The portable ZIP includes `Install.cmd`, which copies the app to:
 
@@ -187,7 +189,7 @@ It also creates Desktop, Start Menu, and in-folder shortcuts.
 To build the unsigned setup EXE for local testing, pass `-BuildSetup`:
 
 ```powershell
-.\scripts\package_release.ps1 -Version 1.0.1 -BuildSetup
+.\scripts\package_release.ps1 -Version 1.0.2 -BuildSetup
 ```
 
 Do not publish the unsigned setup EXE unless you expect browser or antivirus warnings.

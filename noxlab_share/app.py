@@ -17,7 +17,7 @@ import tkinter as tk
 from PIL import ImageTk
 
 from .qr_tools import copy_image_to_clipboard, create_qr_image, save_qr_image
-from .server import ReceiveServer, ShareItem, ShareServer
+from .server import DownloadCompleteEvent, ReceiveServer, ShareItem, ShareServer
 from .utils import ZipPreparationCancelled, build_folder_zip, folder_size, format_bytes, remove_temp_file
 
 
@@ -92,6 +92,7 @@ class NoxLabShareApp(tk.Tk):
         self.qr_image = None
         self.qr_photo = None
         self.log_queue: queue.Queue[str] = queue.Queue()
+        self.download_events: queue.Queue[DownloadCompleteEvent] = queue.Queue()
         self.timer_after_id: str | None = None
         self.deadline: datetime | None = None
         self.auto_stop_pending = False
@@ -100,6 +101,7 @@ class NoxLabShareApp(tk.Tk):
         self.selected_type_var = tk.StringVar(value="-")
         self.selected_size_var = tk.StringVar(value="-")
         self.status_var = tk.StringVar(value="Idle")
+        self.last_download_var = tk.StringVar(value="-")
         self.lan_url_var = tk.StringVar(value="")
         self.password_enabled_var = tk.BooleanVar(value=False)
         self.password_status_var = tk.StringVar(value="Off")
@@ -112,6 +114,7 @@ class NoxLabShareApp(tk.Tk):
         self._build_ui()
         self._set_running_state(False)
         self._poll_logs()
+        self._poll_download_events()
         self._poll_prepare_events()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(150, self._maximize_on_windows)
@@ -333,6 +336,7 @@ class NoxLabShareApp(tk.Tk):
         self._value_row(status_panel, 0, "Service", self.status_var, accent=True)
         self._value_row(status_panel, 1, "Password", self.password_status_var)
         self._value_row(status_panel, 2, "Timer", self.timer_status_var)
+        self._value_row(status_panel, 3, "Last download", self.last_download_var)
 
         url_title = self._section_title(parent, "LAN URL")
         url_title.grid(row=7, column=0, sticky="ew", pady=(4, 0))
@@ -703,6 +707,7 @@ class NoxLabShareApp(tk.Tk):
         self.selected_name_var.set(str(path))
         self.selected_type_var.set("Folder (ZIP will be created on start)" if is_folder else "File")
         self.selected_size_var.set(format_bytes(size))
+        self.last_download_var.set("-")
         self.status_var.set("Ready")
 
     def _update_password_state(self) -> None:
@@ -733,12 +738,18 @@ class NoxLabShareApp(tk.Tk):
             self.status_var.set("Preparing")
             self.update_idletasks()
             item = self._prepare_share_item()
-            self.server = ShareServer(item=item, password=password, log_callback=self._enqueue_log)
+            self.server = ShareServer(
+                item=item,
+                password=password,
+                log_callback=self._enqueue_log,
+                download_complete_callback=self._enqueue_download_complete,
+            )
             url = self.server.start()
             self.lan_url_var.set(url)
             self._render_qr(url)
             self._set_running_state(True)
             self._start_timer_if_needed()
+            self.last_download_var.set("Waiting for a device")
             self.status_var.set("Sharing")
             self._log("Share is live on the local network")
         except Exception as exc:
@@ -802,7 +813,12 @@ class NoxLabShareApp(tk.Tk):
                 served_size=zip_path.stat().st_size,
                 is_folder=True,
             )
-            server = ShareServer(item=item, password=password, log_callback=self._enqueue_log)
+            server = ShareServer(
+                item=item,
+                password=password,
+                log_callback=self._enqueue_log,
+                download_complete_callback=self._enqueue_download_complete,
+            )
             url = server.start()
             self.prepare_events.put(("ready", (server, zip_path, url)))
         except ZipPreparationCancelled:
@@ -843,6 +859,7 @@ class NoxLabShareApp(tk.Tk):
                     self._render_qr(url)
                     self._set_running_state(True)
                     self._start_timer_if_needed()
+                    self.last_download_var.set("Waiting for a device")
                     self.status_var.set("Sharing")
                     self._log("Folder ZIP is ready. Share is live on the local network")
                 elif event == "cancelled":
@@ -897,6 +914,7 @@ class NoxLabShareApp(tk.Tk):
             self._render_qr(url)
             self._set_running_state(True)
             self._start_timer_if_needed()
+            self.last_download_var.set("-")
             self.status_var.set("Receiving")
             self._log(f"Ready to receive files into {self.receive_folder}")
             self._log(f"Upload limit: {self.upload_limit_var.get()}")
@@ -996,6 +1014,7 @@ class NoxLabShareApp(tk.Tk):
         self.selected_name_var.set("No file or folder selected")
         self.selected_type_var.set("-")
         self.selected_size_var.set("-")
+        self.last_download_var.set("-")
         self.status_var.set("Idle")
         self.password_enabled_var.set(False)
         self.password_entry.configure(state="normal")
@@ -1121,6 +1140,9 @@ class NoxLabShareApp(tk.Tk):
     def _enqueue_log(self, message: str) -> None:
         self.log_queue.put(message)
 
+    def _enqueue_download_complete(self, event: DownloadCompleteEvent) -> None:
+        self.download_events.put(event)
+
     def _poll_logs(self) -> None:
         try:
             while True:
@@ -1128,6 +1150,17 @@ class NoxLabShareApp(tk.Tk):
         except queue.Empty:
             pass
         self.after(250, self._poll_logs)
+
+    def _poll_download_events(self) -> None:
+        try:
+            while True:
+                event = self.download_events.get_nowait()
+                finished_at = event.completed_at.strftime("%H:%M:%S")
+                state = "resumed download finished" if event.resumed else "download finished"
+                self.last_download_var.set(f"{finished_at} | {event.device_ip} | {state}")
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_download_events)
 
     def _log(self, message: str) -> None:
         self._append_log(message)

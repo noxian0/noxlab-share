@@ -5,9 +5,10 @@ import html
 import mimetypes
 import os
 import secrets
-import shutil
+import socket
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
@@ -17,6 +18,7 @@ from .utils import format_bytes, get_lan_ip
 
 
 LogCallback = Callable[[str], None]
+DownloadCompleteCallback = Callable[["DownloadCompleteEvent"], None]
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,18 @@ class ShareItem:
         return "Folder ZIP" if self.is_folder else "File"
 
 
+@dataclass(frozen=True)
+class DownloadCompleteEvent:
+    """A browser received the final byte needed for a download transfer."""
+
+    device_ip: str
+    item_name: str
+    completed_at: datetime
+    resumed: bool
+    transferred_bytes: int
+    total_bytes: int
+
+
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
@@ -45,11 +59,13 @@ class ShareServer:
         password: str | None = None,
         start_port: int = 8765,
         log_callback: LogCallback | None = None,
+        download_complete_callback: DownloadCompleteCallback | None = None,
     ) -> None:
         self.item = item
         self.password = password or ""
         self.start_port = start_port
         self.log_callback = log_callback or (lambda message: None)
+        self.download_complete_callback = download_complete_callback or (lambda _event: None)
         self.httpd: ReusableThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.port: int | None = None
@@ -57,12 +73,16 @@ class ShareServer:
         self.url = ""
         self.auth_cookie_name = "noxlab_share_auth"
         self.auth_cookie_value = secrets.token_urlsafe(32)
+        self._active_connections: set[socket.socket] = set()
+        self._connection_lock = threading.Lock()
+        self._stopping = threading.Event()
 
     @property
     def password_required(self) -> bool:
         return bool(self.password)
 
     def start(self) -> str:
+        self._stopping.clear()
         handler_class = self._make_handler()
         last_error: OSError | None = None
 
@@ -84,6 +104,20 @@ class ShareServer:
         return self.url
 
     def stop(self) -> None:
+        self._stopping.set()
+        with self._connection_lock:
+            active_connections = tuple(self._active_connections)
+
+        for connection in active_connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
+
         if self.httpd:
             self.httpd.shutdown()
             self.httpd.server_close()
@@ -209,9 +243,27 @@ class ShareServer:
         encoded_name = quote(self.item.served_name)
 
         try:
-            handler.send_response(200)
+            file_size = path.stat().st_size
+            byte_range = self._parse_byte_range(handler.headers.get("Range"), file_size)
+        except ValueError:
+            self._send_range_not_satisfiable(handler, path)
+            return
+        except OSError as exc:
+            self.log_callback(f"Download error: {exc}")
+            self._send_html(handler, self._download_page(error="Shared file is no longer available."), status=410)
+            return
+
+        start, end = byte_range if byte_range else (0, max(file_size - 1, 0))
+        content_length = end - start + 1 if file_size else 0
+        is_partial = byte_range is not None
+
+        try:
+            handler.send_response(206 if is_partial else 200)
             handler.send_header("Content-Type", mime_type)
-            handler.send_header("Content-Length", str(path.stat().st_size))
+            handler.send_header("Content-Length", str(content_length))
+            handler.send_header("Accept-Ranges", "bytes")
+            if is_partial:
+                handler.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
             handler.send_header(
                 "Content-Disposition",
                 f'attachment; filename="{safe_name}"; filename*=UTF-8\'\'{encoded_name}',
@@ -221,14 +273,119 @@ class ShareServer:
             handler.end_headers()
 
             if not headers_only:
-                with path.open("rb") as source:
-                    shutil.copyfileobj(source, handler.wfile)
+                self._register_connection(handler.connection)
+                try:
+                    with path.open("rb") as source:
+                        source.seek(start)
+                        self._copy_file_range(source, handler.wfile, content_length)
+                finally:
+                    self._unregister_connection(handler.connection)
 
-                self.log_callback(f"Device {handler.client_address[0]} downloaded {self.item.served_name}")
-        except (BrokenPipeError, ConnectionResetError):
-            self.log_callback(f"Download interrupted from {handler.client_address[0]}")
+                self._report_download_completion(
+                    device_ip=handler.client_address[0],
+                    start=start,
+                    end=end,
+                    file_size=file_size,
+                )
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            message = "Download stopped" if self._stopping.is_set() else "Download interrupted"
+            self.log_callback(f"{message} from {handler.client_address[0]}")
         except OSError as exc:
-            self.log_callback(f"Download error: {exc}")
+            if self._stopping.is_set():
+                self.log_callback(f"Download stopped from {handler.client_address[0]}")
+            else:
+                self.log_callback(f"Download error: {exc}")
+
+    def _report_download_completion(self, device_ip: str, start: int, end: int, file_size: int) -> None:
+        if end != file_size - 1:
+            self.log_callback(f"Device {device_ip} received part of {self.item.served_name}")
+            return
+
+        resumed = start > 0
+        transferred_bytes = end - start + 1 if file_size else 0
+        event = DownloadCompleteEvent(
+            device_ip=device_ip,
+            item_name=self.item.served_name,
+            completed_at=datetime.now(),
+            resumed=resumed,
+            transferred_bytes=transferred_bytes,
+            total_bytes=file_size,
+        )
+        self.download_complete_callback(event)
+
+        if resumed:
+            self.log_callback(
+                f"Resumed download finished: {device_ip} received the final {format_bytes(transferred_bytes)}"
+            )
+        else:
+            self.log_callback(f"Download finished: {device_ip} received {self.item.served_name}")
+
+    @staticmethod
+    def _parse_byte_range(range_header: str | None, file_size: int) -> tuple[int, int] | None:
+        if not range_header:
+            return None
+        if file_size <= 0:
+            raise ValueError("Cannot serve a range from an empty file.")
+
+        unit, separator, values = range_header.partition("=")
+        if separator != "=" or unit.strip().lower() != "bytes" or "," in values:
+            raise ValueError("Unsupported byte range.")
+
+        start_text, dash, end_text = values.strip().partition("-")
+        if dash != "-":
+            raise ValueError("Invalid byte range.")
+
+        if not start_text:
+            try:
+                suffix_length = int(end_text)
+            except ValueError as exc:
+                raise ValueError("Invalid byte range.") from exc
+            if suffix_length <= 0:
+                raise ValueError("Invalid byte range.")
+            return max(file_size - suffix_length, 0), file_size - 1
+
+        try:
+            start = int(start_text)
+            end = int(end_text) if end_text else file_size - 1
+        except ValueError as exc:
+            raise ValueError("Invalid byte range.") from exc
+
+        if start < 0 or start >= file_size or end < start:
+            raise ValueError("Invalid byte range.")
+        return start, min(end, file_size - 1)
+
+    @staticmethod
+    def _send_range_not_satisfiable(handler: BaseHTTPRequestHandler, path: Path) -> None:
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            file_size = 0
+        handler.send_response(416)
+        handler.send_header("Accept-Ranges", "bytes")
+        handler.send_header("Content-Range", f"bytes */{file_size}")
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+
+    def _copy_file_range(self, source, destination, remaining: int) -> None:
+        chunk_size = 1024 * 1024
+        while remaining > 0:
+            if self._stopping.is_set():
+                raise ConnectionAbortedError("Sharing was stopped.")
+            chunk = source.read(min(chunk_size, remaining))
+            if not chunk:
+                raise OSError("Shared file changed while it was being downloaded.")
+            destination.write(chunk)
+            remaining -= len(chunk)
+
+    def _register_connection(self, connection: socket.socket) -> None:
+        with self._connection_lock:
+            if self._stopping.is_set():
+                raise ConnectionAbortedError("Sharing was stopped.")
+            self._active_connections.add(connection)
+
+    def _unregister_connection(self, connection: socket.socket) -> None:
+        with self._connection_lock:
+            self._active_connections.discard(connection)
 
     def _file_url(self) -> str:
         return f"/file/{quote(self.item.served_name, safe='')}"

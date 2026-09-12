@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import threading
+from io import BytesIO
 import http.cookiejar
 import urllib.error
 import urllib.parse
@@ -46,6 +47,7 @@ def upload_request(url: str, parts: list[tuple[str, str | None, bytes]], boundar
 
 def main() -> None:
     logs: list[str] = []
+    completed_downloads = []
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -63,7 +65,12 @@ def main() -> None:
             is_folder=False,
         )
 
-        server = ShareServer(item=item, start_port=19876, log_callback=logs.append)
+        server = ShareServer(
+            item=item,
+            start_port=19876,
+            log_callback=logs.append,
+            download_complete_callback=completed_downloads.append,
+        )
         server.start()
         base = f"http://127.0.0.1:{server.port}"
         page = urllib.request.urlopen(f"{base}/download", timeout=5).read().decode("utf-8")
@@ -73,9 +80,56 @@ def main() -> None:
         assert redirected.url.endswith("/file/hello.txt")
         downloaded = redirected.read()
         assert downloaded == payload
+        assert len(completed_downloads) == 1
+        assert completed_downloads[0].device_ip == "127.0.0.1"
+        assert completed_downloads[0].item_name == "hello.txt"
+        assert not completed_downloads[0].resumed
+        assert completed_downloads[0].transferred_bytes == len(payload)
+        assert completed_downloads[0].total_bytes == len(payload)
         direct = urllib.request.urlopen(f"{base}/file/hello.txt", timeout=5)
         assert direct.headers["Content-Disposition"].startswith('attachment; filename="hello.txt"')
+        assert direct.headers["Accept-Ranges"] == "bytes"
         assert direct.read() == payload
+        assert len(completed_downloads) == 2
+
+        partial_request = urllib.request.Request(
+            f"{base}/file/hello.txt",
+            headers={"Range": "bytes=6-"},
+        )
+        partial = urllib.request.urlopen(partial_request, timeout=5)
+        assert partial.status == 206
+        assert partial.headers["Content-Range"] == f"bytes 6-{len(payload) - 1}/{len(payload)}"
+        assert partial.read() == payload[6:]
+        assert len(completed_downloads) == 3
+        assert completed_downloads[-1].resumed
+        assert completed_downloads[-1].transferred_bytes == len(payload) - 6
+
+        suffix_request = urllib.request.Request(
+            f"{base}/file/hello.txt",
+            headers={"Range": "bytes=-5"},
+        )
+        suffix = urllib.request.urlopen(suffix_request, timeout=5)
+        assert suffix.status == 206
+        assert suffix.read() == payload[-5:]
+
+        invalid_range_request = urllib.request.Request(
+            f"{base}/file/hello.txt",
+            headers={"Range": f"bytes={len(payload)}-"},
+        )
+        try:
+            urllib.request.urlopen(invalid_range_request, timeout=5)
+            raise AssertionError("invalid byte range unexpectedly succeeded")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 416
+            assert exc.headers["Content-Range"] == f"bytes */{len(payload)}"
+
+        server._stopping.set()
+        try:
+            server._copy_file_range(BytesIO(payload), BytesIO(), len(payload))
+            raise AssertionError("stopped server continued copying")
+        except ConnectionAbortedError:
+            pass
+        server._stopping.clear()
         server.stop()
 
         protected = ShareServer(item=item, password="secret", start_port=19876, log_callback=logs.append)
