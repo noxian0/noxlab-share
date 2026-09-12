@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
+from typing import Callable
 
 
 def format_bytes(size: int) -> str:
@@ -58,10 +61,33 @@ def get_lan_ip() -> str:
     return "127.0.0.1"
 
 
-def build_folder_zip(folder_path: Path) -> Path:
-    """Create a temporary ZIP containing the selected folder."""
+class ZipPreparationCancelled(RuntimeError):
+    """Raised when a folder ZIP is cancelled before it is ready to share."""
+
+
+ZipProgressCallback = Callable[[int, int, Path], None]
+
+
+def build_folder_zip(
+    folder_path: Path,
+    *,
+    total_bytes: int | None = None,
+    progress_callback: ZipProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> Path:
+    """Create a temporary transfer ZIP without blocking the app's interface."""
     folder_path = folder_path.resolve()
     root_name = folder_path.name or "shared-folder"
+    temp_dir = Path(tempfile.gettempdir())
+
+    if total_bytes is not None:
+        required_space = total_bytes + 16 * 1024 * 1024
+        available_space = shutil.disk_usage(temp_dir).free
+        if available_space < required_space:
+            raise OSError(
+                "Not enough free space for the temporary folder ZIP. "
+                f"Need about {format_bytes(required_space)} free on {temp_dir.drive or temp_dir}."
+            )
 
     temp = tempfile.NamedTemporaryFile(
         prefix="noxlab_share_",
@@ -71,9 +97,21 @@ def build_folder_zip(folder_path: Path) -> Path:
     temp_path = Path(temp.name)
     temp.close()
 
+    completed_bytes = 0
+
+    def report_progress(current_item: Path) -> None:
+        if progress_callback:
+            progress_callback(completed_bytes, total_bytes or 0, current_item)
+
     try:
-        with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+        report_progress(folder_path)
+        # Sharing favors quick preparation over shrinking the archive. This is
+        # especially important for large folders containing video, games, or archives.
+        with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_STORED, allowZip64=True) as archive:
             for item in folder_path.rglob("*"):
+                if cancel_event and cancel_event.is_set():
+                    raise ZipPreparationCancelled("Folder preparation was stopped.")
+
                 relative = item.relative_to(folder_path)
                 archive_name = (Path(root_name) / relative).as_posix()
 
@@ -84,7 +122,13 @@ def build_folder_zip(folder_path: Path) -> Path:
                     except OSError:
                         continue
                 elif item.is_file():
-                    archive.write(item, archive_name)
+                    try:
+                        item_size = item.stat().st_size
+                        archive.write(item, archive_name)
+                    except OSError:
+                        continue
+                    completed_bytes += item_size
+                    report_progress(relative)
         return temp_path
     except Exception:
         try:

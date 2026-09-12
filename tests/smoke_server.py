@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import http.cookiejar
 import urllib.error
 import urllib.parse
@@ -13,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from noxlab_share.server import ReceiveServer, ShareItem, ShareServer
-from noxlab_share.utils import build_folder_zip, remove_temp_file
+from noxlab_share.utils import ZipPreparationCancelled, build_folder_zip, remove_temp_file
 
 
 def multipart_body(parts: list[tuple[str, str | None, bytes]], boundary: str) -> bytes:
@@ -99,11 +100,26 @@ def main() -> None:
         folder = root / "folder"
         folder.mkdir()
         (folder / "nested.txt").write_text("inside folder", encoding="utf-8")
-        zip_path = build_folder_zip(folder)
+        progress: list[tuple[int, int, Path]] = []
+        zip_path = build_folder_zip(
+            folder,
+            total_bytes=len("inside folder"),
+            progress_callback=lambda completed, total, current: progress.append((completed, total, current)),
+        )
         assert zip_path.exists()
         assert zip_path.stat().st_size > 0
+        assert progress[-1][0] == len("inside folder")
+        assert progress[-1][1] == len("inside folder")
         remove_temp_file(zip_path)
         assert not zip_path.exists()
+
+        cancelled = threading.Event()
+        cancelled.set()
+        try:
+            build_folder_zip(folder, cancel_event=cancelled)
+            raise AssertionError("cancelled folder ZIP unexpectedly succeeded")
+        except ZipPreparationCancelled:
+            pass
 
         receive_dir = root / "received"
         receive = ReceiveServer(receive_dir, start_port=19890, log_callback=logs.append)

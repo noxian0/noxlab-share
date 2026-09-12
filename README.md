@@ -57,7 +57,7 @@ For building a Windows release:
 
 ## Download from GitHub
 
-Download `NoxLabShare-1.0.0-windows.zip` from the latest GitHub Release.
+Download `NoxLabShare-1.0.1-windows.zip` from the latest GitHub Release.
 
 The ZIP includes:
 
@@ -168,13 +168,13 @@ pip install pyinstaller
 Build the standalone app and portable ZIP:
 
 ```powershell
-.\scripts\package_release.ps1 -Version 1.0.0
+.\scripts\package_release.ps1 -Version 1.0.1
 ```
 
 Outputs:
 
 - `dist\NoxLab Share.exe` standalone app
-- `release\NoxLabShare-1.0.0-windows.zip` portable release
+- `release\NoxLabShare-1.0.1-windows.zip` portable release
 
 The portable ZIP includes `Install.cmd`, which copies the app to:
 
@@ -187,7 +187,7 @@ It also creates Desktop, Start Menu, and in-folder shortcuts.
 To build the unsigned setup EXE for local testing, pass `-BuildSetup`:
 
 ```powershell
-.\scripts\package_release.ps1 -Version 1.0.0 -BuildSetup
+.\scripts\package_release.ps1 -Version 1.0.1 -BuildSetup
 ```
 
 Do not publish the unsigned setup EXE unless you expect browser or antivirus warnings.

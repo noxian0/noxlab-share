@@ -5,6 +5,8 @@ import queue
 import os
 import platform
 import sys
+import threading
+import time
 import traceback
 import webbrowser
 from datetime import datetime, timedelta
@@ -16,7 +18,7 @@ from PIL import ImageTk
 
 from .qr_tools import copy_image_to_clipboard, create_qr_image, save_qr_image
 from .server import ReceiveServer, ShareItem, ShareServer
-from .utils import build_folder_zip, folder_size, format_bytes, remove_temp_file
+from .utils import ZipPreparationCancelled, build_folder_zip, folder_size, format_bytes, remove_temp_file
 
 
 BG = "#0c0e12"
@@ -34,6 +36,7 @@ RECEIVE_DARK = "#174ea6"
 SCROLL_TRACK = "#11141a"
 SCROLL_THUMB = "#c62828"
 SCROLL_THUMB_ACTIVE = "#ff443f"
+WINDOWS_APP_ID = "noxian0.NoxLabShare"
 
 
 UPLOAD_LIMITS: dict[str, int | None] = {
@@ -59,6 +62,15 @@ def resource_path(relative_path: str) -> Path:
     return base_path / relative_path
 
 
+def set_windows_app_id() -> None:
+    if platform.system() != "Windows":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
+    except (AttributeError, OSError):
+        pass
+
+
 class NoxLabShareApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -74,6 +86,9 @@ class NoxLabShareApp(tk.Tk):
         self.temp_zip_path: Path | None = None
         self.server: ShareServer | None = None
         self.receive_server: ReceiveServer | None = None
+        self.preparing_folder = False
+        self.prepare_cancel_event: threading.Event | None = None
+        self.prepare_events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.qr_image = None
         self.qr_photo = None
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -97,6 +112,7 @@ class NoxLabShareApp(tk.Tk):
         self._build_ui()
         self._set_running_state(False)
         self._poll_logs()
+        self._poll_prepare_events()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(150, self._maximize_on_windows)
 
@@ -709,6 +725,10 @@ class NoxLabShareApp(tk.Tk):
                 messagebox.showwarning("Password required", "Enter a password or turn password protection off.")
                 return
 
+        if self.selected_is_folder:
+            self._begin_folder_preparation(self.selected_path, password)
+            return
+
         try:
             self.status_var.set("Preparing")
             self.update_idletasks()
@@ -727,6 +747,120 @@ class NoxLabShareApp(tk.Tk):
             self.status_var.set("Error")
             self._log(f"Error: {exc}")
             self._show_error("Could not start sharing", exc)
+
+    def _begin_folder_preparation(self, selected: Path, password: str) -> None:
+        self.preparing_folder = True
+        self.prepare_cancel_event = threading.Event()
+        self.status_var.set("Preparing folder ZIP")
+        self._set_running_state(False)
+        self._log(f"Preparing {format_bytes(self.selected_size)} folder for sharing")
+        self._log("Creating a fast transfer ZIP. The app will stay responsive while it prepares.")
+
+        worker = threading.Thread(
+            target=self._prepare_folder_worker,
+            args=(selected, self.selected_size, password, self.prepare_cancel_event),
+            name="NoxLabFolderPreparation",
+            daemon=True,
+        )
+        worker.start()
+
+    def _prepare_folder_worker(
+        self,
+        selected: Path,
+        original_size: int,
+        password: str,
+        cancel_event: threading.Event,
+    ) -> None:
+        last_update = 0.0
+
+        def on_progress(completed: int, total: int, current_item: Path) -> None:
+            nonlocal last_update
+            now = time.monotonic()
+            if completed and now - last_update < 0.4 and completed < total:
+                return
+            last_update = now
+            self.prepare_events.put(("progress", (completed, total, current_item.name)))
+
+        zip_path: Path | None = None
+        server: ShareServer | None = None
+        try:
+            zip_path = build_folder_zip(
+                selected,
+                total_bytes=original_size,
+                progress_callback=on_progress,
+                cancel_event=cancel_event,
+            )
+            if cancel_event.is_set():
+                raise ZipPreparationCancelled("Folder preparation was stopped.")
+
+            item = ShareItem(
+                source_path=selected,
+                served_path=zip_path,
+                display_name=selected.name or str(selected),
+                served_name=f"{selected.name or 'shared-folder'}.zip",
+                original_size=original_size,
+                served_size=zip_path.stat().st_size,
+                is_folder=True,
+            )
+            server = ShareServer(item=item, password=password, log_callback=self._enqueue_log)
+            url = server.start()
+            self.prepare_events.put(("ready", (server, zip_path, url)))
+        except ZipPreparationCancelled:
+            if server:
+                server.stop()
+            remove_temp_file(zip_path)
+            self.prepare_events.put(("cancelled", None))
+        except Exception as exc:
+            if server:
+                server.stop()
+            remove_temp_file(zip_path)
+            self.prepare_events.put(("error", exc))
+
+    def _poll_prepare_events(self) -> None:
+        try:
+            while True:
+                event, value = self.prepare_events.get_nowait()
+                if event == "progress":
+                    completed, total, current_name = value
+                    if total:
+                        percent = min(100, int(completed * 100 / total))
+                        self.status_var.set(
+                            f"Preparing ZIP: {percent}% ({format_bytes(completed)} of {format_bytes(total)})"
+                        )
+                    else:
+                        self.status_var.set(f"Preparing ZIP: {format_bytes(completed)}")
+                elif event == "ready":
+                    server, zip_path, url = value
+                    if not self.preparing_folder:
+                        server.stop()
+                        remove_temp_file(zip_path)
+                        continue
+                    self.preparing_folder = False
+                    self.prepare_cancel_event = None
+                    self.server = server
+                    self.temp_zip_path = zip_path
+                    self.lan_url_var.set(url)
+                    self._render_qr(url)
+                    self._set_running_state(True)
+                    self._start_timer_if_needed()
+                    self.status_var.set("Sharing")
+                    self._log("Folder ZIP is ready. Share is live on the local network")
+                elif event == "cancelled":
+                    self.preparing_folder = False
+                    self.prepare_cancel_event = None
+                    self.status_var.set("Stopped")
+                    self._set_running_state(False)
+                    self._log("Folder preparation stopped")
+                elif event == "error":
+                    self.preparing_folder = False
+                    self.prepare_cancel_event = None
+                    self.status_var.set("Error")
+                    self._set_running_state(False)
+                    self._log(f"Error while preparing folder: {value}")
+                    self._show_error("Could not prepare folder", value)
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_prepare_events)
 
     def _choose_receive_folder(self) -> None:
         path = filedialog.askdirectory(title="Choose where received files should be saved", initialdir=str(self.receive_folder))
@@ -838,6 +972,12 @@ class NoxLabShareApp(tk.Tk):
         self._set_running_state(False)
 
     def _stop_active_service(self) -> None:
+        if self.preparing_folder:
+            if self.prepare_cancel_event:
+                self.prepare_cancel_event.set()
+            self.status_var.set("Stopping folder preparation")
+            self._log("Stopping folder ZIP preparation")
+            return
         if self.server:
             self._stop_sharing()
             return
@@ -848,6 +988,8 @@ class NoxLabShareApp(tk.Tk):
 
     def _clear_reset(self) -> None:
         self._stop_active_service()
+        if self.preparing_folder:
+            return
         self.selected_path = None
         self.selected_is_folder = False
         self.selected_size = 0
@@ -864,23 +1006,24 @@ class NoxLabShareApp(tk.Tk):
         self._log("Reset complete")
 
     def _set_running_state(self, running: bool) -> None:
+        busy = running or self.preparing_folder
         normal = "normal"
         disabled = "disabled"
-        self.start_button.configure(state=disabled if running else normal)
-        self.stop_button.configure(state=normal if running else disabled)
+        self.start_button.configure(state=disabled if busy else normal)
+        self.stop_button.configure(state=normal if busy else disabled)
         self.copy_link_button.configure(state=normal if running else disabled)
         self.open_page_button.configure(state=normal if running else disabled)
         self.save_qr_button.configure(state=normal if running and self.qr_image else disabled)
         self.copy_qr_button.configure(state=normal if running and self.qr_image else disabled)
-        self.select_file_button.configure(state=disabled if running else normal)
-        self.select_folder_button.configure(state=disabled if running else normal)
-        self.start_receive_button.configure(state=disabled if running else normal)
-        self.choose_receive_folder_button.configure(state=disabled if running else normal)
-        self.upload_limit_menu.configure(state=disabled if running else normal)
+        self.select_file_button.configure(state=disabled if busy else normal)
+        self.select_folder_button.configure(state=disabled if busy else normal)
+        self.start_receive_button.configure(state=disabled if busy else normal)
+        self.choose_receive_folder_button.configure(state=disabled if busy else normal)
+        self.upload_limit_menu.configure(state=disabled if busy else normal)
         self.open_receive_folder_button.configure(state=normal)
-        self.password_check.configure(state=disabled if running else normal)
-        self.password_entry.configure(state=disabled if running or not self.password_enabled_var.get() else normal)
-        self.timer_menu.configure(state=disabled if running else normal)
+        self.password_check.configure(state=disabled if busy else normal)
+        self.password_entry.configure(state=disabled if busy or not self.password_enabled_var.get() else normal)
+        self.timer_menu.configure(state=disabled if busy else normal)
 
     def _render_qr(self, url: str) -> None:
         self.qr_image = create_qr_image(url, size=280)
@@ -1009,6 +1152,7 @@ class NoxLabShareApp(tk.Tk):
 
 
 def main() -> None:
+    set_windows_app_id()
     try:
         app = NoxLabShareApp()
     except Exception as exc:
