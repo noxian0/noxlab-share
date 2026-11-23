@@ -116,17 +116,11 @@ def build_folder_zip(
                 archive_name = (Path(root_name) / relative).as_posix()
 
                 if item.is_dir():
-                    try:
-                        if not any(item.iterdir()):
-                            archive.writestr(f"{archive_name.rstrip('/')}/", "")
-                    except OSError:
-                        continue
+                    if not any(item.iterdir()):
+                        archive.writestr(f"{archive_name.rstrip('/')}/", "")
                 elif item.is_file():
-                    try:
-                        item_size = item.stat().st_size
-                        archive.write(item, archive_name)
-                    except OSError:
-                        continue
+                    item_size = item.stat().st_size
+                    archive.write(item, archive_name)
                     completed_bytes += item_size
                     report_progress(relative)
         return temp_path

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.0",
+    [string]$Version,
     [switch]$BuildSetup
 )
 
@@ -8,6 +8,10 @@ $ErrorActionPreference = "Stop"
 $projectDir = Get-Location
 $venvPython = Join-Path $projectDir ".venv\Scripts\python.exe"
 $python = if (Test-Path $venvPython) { $venvPython } else { "python" }
+if (-not $Version) {
+    $Version = & $python -c "from noxlab_share import __version__; print(__version__)"
+    if ($LASTEXITCODE -ne 0) { throw "Could not determine app version." }
+}
 
 $distName = "NoxLabShare-$Version-windows"
 $releaseDir = Join-Path $projectDir "release"
@@ -19,14 +23,18 @@ $launcherPath = Join-Path $projectDir "noxlab_share_launcher.py"
 
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 
-if (-not (Test-Path $iconPath)) {
+if (-not (Test-Path $iconPath) -or -not (Test-Path -LiteralPath "assets\noxlab_share.png")) {
     & $python .\scripts\generate_icon.py
+    if ($LASTEXITCODE -ne 0) { throw "Could not generate the app icons." }
 }
 
 & $python -m PyInstaller --noconfirm --clean --windowed --onefile `
     --name "NoxLab Share" `
     --icon $iconPath `
     --add-data "$iconPath;assets" `
+    --add-data "$projectDir\noxlab_share\upload.js;noxlab_share" `
+    --add-data "$projectDir\noxlab_share\mobile.css;noxlab_share" `
+    --add-data "$projectDir\assets\noxlab_share.png;assets" `
     --collect-all qrcode `
     --collect-all PIL `
     $launcherPath
@@ -49,6 +57,8 @@ Copy-Item -LiteralPath $exePath -Destination (Join-Path $payloadDir "NoxLab Shar
 Copy-Item -LiteralPath $iconPath -Destination (Join-Path $payloadDir "noxlab_share.ico") -Force
 Copy-Item -LiteralPath "README.md" -Destination $payloadDir -Force
 Copy-Item -LiteralPath "LICENSE" -Destination $payloadDir -Force
+$pictures = New-Item -ItemType Directory -Path (Join-Path $payloadDir "pics") -Force
+Copy-Item -LiteralPath "pics\main.png", "pics\shared.png", "pics\mobile.png" -Destination $pictures.FullName
 Copy-Item -LiteralPath "scripts\install_noxlab_share.ps1" -Destination $payloadDir -Force
 Copy-Item -LiteralPath "scripts\install_noxlab_share.cmd" -Destination (Join-Path $payloadDir "Install.cmd") -Force
 

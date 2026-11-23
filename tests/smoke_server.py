@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import socket
+import time
+from unittest.mock import patch
+from dataclasses import replace
 from io import BytesIO
 import http.cookiejar
 import urllib.error
@@ -15,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from noxlab_share.server import ReceiveServer, ShareItem, ShareServer
+from noxlab_share.incoming import CHUNK_SIZE, UploadError
 from noxlab_share.utils import ZipPreparationCancelled, build_folder_zip, remove_temp_file
 
 
@@ -43,6 +48,38 @@ def upload_request(url: str, parts: list[tuple[str, str | None, bytes]], boundar
         method="POST",
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
+
+
+def expect_continue_upload(host: str, port: int, filename: str, payload: bytes) -> bytes:
+    boundary = "----NoxLabExpectBoundary"
+    body = multipart_body([("files", filename, payload)], boundary)
+    request = (
+        f"POST /upload HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Expect: 100-continue\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii")
+
+    with socket.create_connection((host, port), timeout=5) as connection:
+        connection.sendall(request)
+        interim = connection.recv(1024)
+        assert b"100 Continue" in interim
+        connection.sendall(body)
+        response = bytearray()
+        while chunk := connection.recv(8192):
+            response.extend(chunk)
+    return bytes(response)
+
+
+def wait_for(predicate, timeout: float = 2) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("Timed out waiting for the server event.")
 
 
 def main() -> None:
@@ -80,7 +117,7 @@ def main() -> None:
         assert redirected.url.endswith("/file/hello.txt")
         downloaded = redirected.read()
         assert downloaded == payload
-        assert len(completed_downloads) == 1
+        wait_for(lambda: len(completed_downloads) >= 1)
         assert completed_downloads[0].device_ip == "127.0.0.1"
         assert completed_downloads[0].item_name == "hello.txt"
         assert not completed_downloads[0].resumed
@@ -90,7 +127,7 @@ def main() -> None:
         assert direct.headers["Content-Disposition"].startswith('attachment; filename="hello.txt"')
         assert direct.headers["Accept-Ranges"] == "bytes"
         assert direct.read() == payload
-        assert len(completed_downloads) == 2
+        wait_for(lambda: len(completed_downloads) >= 2)
 
         partial_request = urllib.request.Request(
             f"{base}/file/hello.txt",
@@ -100,7 +137,7 @@ def main() -> None:
         assert partial.status == 206
         assert partial.headers["Content-Range"] == f"bytes 6-{len(payload) - 1}/{len(payload)}"
         assert partial.read() == payload[6:]
-        assert len(completed_downloads) == 3
+        wait_for(lambda: len(completed_downloads) >= 3)
         assert completed_downloads[-1].resumed
         assert completed_downloads[-1].transferred_bytes == len(payload) - 6
 
@@ -151,6 +188,19 @@ def main() -> None:
         assert protected_download == payload
         protected.stop()
 
+        empty_path = root / "empty"
+        empty_path.touch()
+        empty_server = ShareServer(replace(item, served_name="\u5f71\u7247.mp4", served_path=empty_path),
+                                   start_port=19876, download_complete_callback=completed_downloads.append)
+        empty_server.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{empty_server.port}" + empty_server._file_url()) as reply:
+                assert reply.read() == b""
+                assert urllib.parse.quote(empty_server.item.served_name) in reply.headers["Content-Disposition"]
+            wait_for(lambda: completed_downloads[-1].item_name == empty_server.item.served_name)
+        finally:
+            empty_server.stop()
+
         folder = root / "folder"
         folder.mkdir()
         (folder / "nested.txt").write_text("inside folder", encoding="utf-8")
@@ -167,6 +217,13 @@ def main() -> None:
         remove_temp_file(zip_path)
         assert not zip_path.exists()
 
+        with patch("zipfile.ZipFile.write", side_effect=OSError("simulated disk write failure")):
+            try:
+                build_folder_zip(folder)
+                raise AssertionError("A failed ZIP write was reported as a successful archive")
+            except OSError as exc:
+                assert "simulated" in str(exc)
+
         cancelled = threading.Event()
         cancelled.set()
         try:
@@ -181,12 +238,33 @@ def main() -> None:
         base = f"http://127.0.0.1:{receive.port}"
         upload_page = urllib.request.urlopen(f"{base}/upload", timeout=5).read().decode("utf-8")
         assert "Send files to this PC" in upload_page
+        assert 'src="/upload.js"' in upload_page
+        assert "opened the receive page" in logs[-1]
+        expect_response = expect_continue_upload("127.0.0.1", receive.port, "expect.txt", b"expect continue")
+        assert b"HTTP/1.1 200 OK" in expect_response
+        assert b"Upload complete" in expect_response
+        assert (receive_dir / "expect.txt").read_bytes() == b"expect continue"
         upload_payload = b"phone file bytes"
         request = upload_request(f"{base}/upload", [("files", "phone-photo.jpg", upload_payload)])
         response = urllib.request.urlopen(request, timeout=5).read().decode("utf-8")
         assert "Upload complete" in response
         assert (receive_dir / "phone-photo.jpg").read_bytes() == upload_payload
+        assert any("started an upload" in entry for entry in logs)
+        staged = receive.incoming
+        metadata = {"name": "unfinished.mp4", "size": CHUNK_SIZE + 1}
+        token = staged.begin(metadata, "test")["token"]
+        try:
+            staged.append(token, CHUNK_SIZE, b"x", "test")
+            raise AssertionError("Accepted a chunk out of order")
+        except UploadError as exc:
+            assert exc.status == 409
+        staged.append(token, 0, bytes(CHUNK_SIZE), "test")
+        assert not (receive_dir / "unfinished.mp4").exists()
+        staged.discard(token)
+        assert not list(receive_dir.glob(".noxlab-*.part"))
+        staged.begin(metadata, "test")
         receive.stop()
+        assert not list(receive_dir.glob(".noxlab-*.part"))
 
         limited_dir = root / "limited-received"
         limited_receive = ReceiveServer(

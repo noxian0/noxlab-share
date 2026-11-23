@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import hmac
-import html
+import json
+import errno
 import mimetypes
 import os
 import secrets
@@ -14,6 +15,8 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from . import mobile
+from .incoming import CHUNK_SIZE, IncomingFiles, UploadError
 from .utils import format_bytes, get_lan_ip
 
 
@@ -38,7 +41,7 @@ class ShareItem:
 
 @dataclass(frozen=True)
 class DownloadCompleteEvent:
-    """A browser received the final byte needed for a download transfer."""
+    """The sender finished writing a response ending at the file's final byte."""
 
     device_ip: str
     item_name: str
@@ -197,7 +200,7 @@ class ShareServer:
         params = parse_qs(raw)
         supplied = params.get("password", [""])[0]
 
-        if self.password_required and not hmac.compare_digest(supplied, self.password):
+        if self.password_required and not hmac.compare_digest(supplied.encode(), self.password.encode()):
             self.log_callback(f"Rejected password attempt from {handler.client_address[0]}")
             self._send_html(handler, self._download_page(error="Incorrect password."), status=401)
             return
@@ -240,7 +243,8 @@ class ShareServer:
             mime_type = "application/zip" if self.item.is_folder else "application/octet-stream"
 
         safe_name = self.item.served_name.replace("\\", "_").replace('"', "'")
-        encoded_name = quote(self.item.served_name)
+        safe_name = safe_name.encode("ascii", "replace").decode("ascii").replace("?", "_")
+        encoded_name = quote(self.item.served_name, safe="")
 
         try:
             file_size = path.stat().st_size
@@ -253,7 +257,7 @@ class ShareServer:
             self._send_html(handler, self._download_page(error="Shared file is no longer available."), status=410)
             return
 
-        start, end = byte_range if byte_range else (0, max(file_size - 1, 0))
+        start, end = byte_range if byte_range else (0, file_size - 1)
         content_length = end - start + 1 if file_size else 0
         is_partial = byte_range is not None
 
@@ -315,10 +319,10 @@ class ShareServer:
 
         if resumed:
             self.log_callback(
-                f"Resumed download finished: {device_ip} received the final {format_bytes(transferred_bytes)}"
+                f"Sent final {format_bytes(transferred_bytes)} of {self.item.served_name} to {device_ip}"
             )
         else:
-            self.log_callback(f"Download finished: {device_ip} received {self.item.served_name}")
+            self.log_callback(f"Sent {self.item.served_name} to {device_ip}")
 
     @staticmethod
     def _parse_byte_range(range_header: str | None, file_size: int) -> tuple[int, int] | None:
@@ -402,173 +406,11 @@ class ShareServer:
         return False
 
     def _download_page(self, error: str | None) -> str:
-        item_name = html.escape(self.item.display_name)
-        served_name = html.escape(self.item.served_name)
-        item_type = html.escape(self.item.display_type)
-        item_size = html.escape(format_bytes(self.item.served_size))
-        source_size = html.escape(format_bytes(self.item.original_size))
-        error_html = ""
-        if error:
-            error_html = f'<p class="error">{html.escape(error)}</p>'
-
-        if self.password_required:
-            action_html = """
-                <form method="post" action="/download" class="download-form">
-                    <label for="password">Password</label>
-                    <input id="password" name="password" type="password" autocomplete="current-password" required>
-                    <button type="submit">Download</button>
-                </form>
-            """
-            password_note = "Password required"
-        else:
-            file_href = html.escape(self._file_url(), quote=True)
-            action_html = f'<a class="button" href="{file_href}" download="{served_name}">Download</a>'
-            password_note = "No password required"
-
-        folder_note = ""
-        if self.item.is_folder:
-            folder_note = f"<p class=\"muted\">Folder is served as <strong>{served_name}</strong>. Original size: {source_size}.</p>"
-
-        return f"""<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>NoxLab Share Download</title>
-    <style>
-        :root {{
-            color-scheme: dark;
-            --bg: #0c0e12;
-            --panel: #171a20;
-            --text: #f2f2f2;
-            --muted: #a6aab2;
-            --red: #e53935;
-            --border: #303640;
-        }}
-        * {{ box-sizing: border-box; }}
-        body {{
-            margin: 0;
-            min-height: 100vh;
-            display: grid;
-            place-items: center;
-            background: var(--bg);
-            color: var(--text);
-            font-family: Segoe UI, Arial, sans-serif;
-            padding: 24px;
-        }}
-        main {{
-            width: min(100%, 560px);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            background: var(--panel);
-            padding: 28px;
-            box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
-        }}
-        .brand {{
-            color: var(--red);
-            font-family: Consolas, monospace;
-            font-size: 14px;
-            font-weight: 700;
-            letter-spacing: 0;
-            margin-bottom: 18px;
-        }}
-        h1 {{
-            font-size: 24px;
-            line-height: 1.2;
-            margin: 0 0 12px;
-            overflow-wrap: anywhere;
-        }}
-        dl {{
-            display: grid;
-            grid-template-columns: 110px 1fr;
-            gap: 8px 12px;
-            margin: 20px 0;
-        }}
-        dt {{ color: var(--muted); }}
-        dd {{ margin: 0; overflow-wrap: anywhere; }}
-        .muted {{
-            color: var(--muted);
-            font-size: 14px;
-            line-height: 1.5;
-        }}
-        .warning {{
-            border-left: 3px solid var(--red);
-            padding: 10px 12px;
-            background: rgba(229, 57, 53, 0.1);
-            margin: 18px 0;
-        }}
-        .error {{
-            color: #ffd2d2;
-            background: rgba(229, 57, 53, 0.18);
-            border: 1px solid rgba(229, 57, 53, 0.4);
-            padding: 10px 12px;
-            border-radius: 6px;
-        }}
-        .button,
-        button {{
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 44px;
-            padding: 0 18px;
-            border: 0;
-            border-radius: 6px;
-            background: var(--red);
-            color: white;
-            font-weight: 700;
-            font-size: 16px;
-            text-decoration: none;
-            cursor: pointer;
-        }}
-        input {{
-            width: 100%;
-            min-height: 42px;
-            border-radius: 6px;
-            border: 1px solid var(--border);
-            background: #0f1217;
-            color: var(--text);
-            padding: 8px 10px;
-            font-size: 16px;
-        }}
-        label {{
-            display: block;
-            margin-bottom: 8px;
-            color: var(--muted);
-        }}
-        .download-form {{
-            display: grid;
-            gap: 12px;
-            margin-top: 18px;
-        }}
-    </style>
-</head>
-<body>
-    <main>
-        <div class="brand">NOXLAB SHARE</div>
-        <h1>{item_name}</h1>
-        <dl>
-            <dt>Type</dt><dd>{item_type}</dd>
-            <dt>Download</dt><dd>{served_name}</dd>
-            <dt>Size</dt><dd>{item_size}</dd>
-            <dt>Security</dt><dd>{password_note}</dd>
-        </dl>
-        {folder_note}
-        <p class="warning muted">This link only works while the sender keeps NoxLab Share running and your device is on the same Wi-Fi or LAN.</p>
-        {error_html}
-        {action_html}
-    </main>
-</body>
-</html>"""
+        return mobile.download_page(self.item, self._file_url(), self.password_required, error)
 
     @staticmethod
     def _not_found_page() -> str:
-        return """<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Not Found</title></head>
-<body style="font-family:Segoe UI,Arial,sans-serif;background:#0c0e12;color:#f2f2f2;padding:24px;">
-<h1>Not found</h1><p>Open /download to access the active NoxLab Share link.</p>
-</body>
-</html>"""
+        return mobile.not_found()
 
     @staticmethod
     def _send_html(handler: BaseHTTPRequestHandler, body: str, status: int = 200) -> None:
@@ -611,6 +453,7 @@ class ReceiveServer:
         self.start_port = start_port
         self.log_callback = log_callback or (lambda message: None)
         self.max_upload_bytes = max_upload_bytes
+        self.incoming = IncomingFiles(self)
         self.httpd: ReusableThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.port: int | None = None
@@ -638,12 +481,14 @@ class ReceiveServer:
             raise RuntimeError(f"Could not start receive server: {last_error}")
 
         self.url = f"http://{self.lan_ip}:{self.port}/upload"
+        self.httpd.service_actions = self.incoming.expire
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
         self.log_callback(f"Receive server started on {self.url}")
         return self.url
 
     def stop(self) -> None:
+        self.incoming.expire(stopping=True)
         if self.httpd:
             self.httpd.shutdown()
             self.httpd.server_close()
@@ -658,6 +503,7 @@ class ReceiveServer:
 
         class RequestHandler(BaseHTTPRequestHandler):
             server_version = "NoxLabShareReceive/0.1"
+            protocol_version = "HTTP/1.1"
 
             def log_message(self, _format: str, *_args: object) -> None:
                 return
@@ -678,9 +524,14 @@ class ReceiveServer:
         if parsed.path == "/":
             self._redirect(handler, "/upload")
             return
+        if parsed.path == "/upload.js":
+            script = Path(__file__).with_name("upload.js").read_bytes()
+            self._respond(handler, script, "text/javascript; charset=utf-8", 200)
+            return
         if parsed.path != "/upload":
             self._send_html(handler, self._not_found_page(), status=404)
             return
+        self.log_callback(f"Device {handler.client_address[0]} opened the receive page")
         self._send_html(handler, self._upload_page())
 
     def _handle_head(self, handler: BaseHTTPRequestHandler) -> None:
@@ -695,6 +546,9 @@ class ReceiveServer:
 
     def _handle_post(self, handler: BaseHTTPRequestHandler) -> None:
         parsed = urlparse(handler.path)
+        if parsed.path in ("/upload/start", "/upload/chunk", "/upload/cancel"):
+            self._receive_chunk_request(handler, parsed.path)
+            return
         if parsed.path != "/upload":
             self._send_html(handler, self._not_found_page(), status=404)
             return
@@ -714,11 +568,16 @@ class ReceiveServer:
             self._send_html(handler, self._upload_page(error="No upload data was received."), status=411)
             return
         if self.max_upload_bytes is not None and content_length > self.max_upload_bytes:
+            self.log_callback(f"Rejected oversized upload from {handler.client_address[0]}")
             self._send_html(handler, self._upload_page(error="Upload is larger than the allowed limit."), status=413)
             return
 
+        self.log_callback(f"Device {handler.client_address[0]} started an upload ({format_bytes(content_length)})")
         try:
             uploaded = self._save_multipart(handler, boundary.encode("utf-8"), content_length)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.log_callback(f"Upload interrupted by {handler.client_address[0]}")
+            return
         except PermissionError as exc:
             handler.close_connection = True
             self._send_html(handler, self._upload_page(error=str(exc)), status=401)
@@ -739,6 +598,49 @@ class ReceiveServer:
             self.log_callback(f"Device {handler.client_address[0]} uploaded {path.name} ({format_bytes(size)})")
 
         self._send_html(handler, self._success_page(uploaded))
+
+    def _receive_chunk_request(self, handler, path):
+        status = 200
+        try:
+            expected_type = "application/json" if path == "/upload/start" else "application/octet-stream"
+            if handler.headers.get_content_type() != expected_type:
+                raise UploadError(415, "Unsupported upload format.")
+            length = int(handler.headers.get("Content-Length", "-1"))
+            limit = {"/upload/start": 8192, "/upload/chunk": CHUNK_SIZE, "/upload/cancel": 0}[path]
+            if not 0 <= length <= limit:
+                raise UploadError(400, "Invalid upload request length.")
+            handler.connection.settimeout(90)
+            body = handler.rfile.read(length)
+            if len(body) != length:
+                raise UploadError(400, "The PC received an incomplete chunk. Retry the upload.")
+            device = handler.client_address[0]
+            token = handler.headers.get("X-Upload-Token", "")
+            if path == "/upload/start":
+                data = json.loads(body)
+                if not isinstance(data, dict):
+                    raise ValueError()
+                result = self.incoming.begin(data, device)
+            elif path == "/upload/chunk":
+                result = self.incoming.append(token, int(handler.headers.get("X-Offset", "-1")), body, device)
+            else:
+                self.incoming.discard(token)
+                result = {}
+        except UploadError as exc:
+            status, result = exc.status, {"error": str(exc)}
+        except ValueError:
+            status, result = 400, {"error": "Invalid transfer details."}
+        except (TimeoutError, ConnectionError):
+            self.log_callback(f"Upload connection interrupted from {handler.client_address[0]}")
+            handler.close_connection = True
+            return
+        except OSError as exc:
+            self.log_callback(f"Upload write error: {exc}")
+            status, result = (507, {"error": "The receive drive is full."}) if exc.errno == errno.ENOSPC else (
+                500, {"error": "The PC could not write the file. Check the receive folder and activity log."})
+        try:
+            self._respond(handler, json.dumps(result).encode(), "application/json", status)
+        except ConnectionError:
+            handler.close_connection = True
 
     def _save_multipart(
         self,
@@ -781,8 +683,12 @@ class ReceiveServer:
             if raw_filename:
                 if not authorized:
                     raise PermissionError("Enter the correct password before uploading files.")
-                target = self._unique_upload_path(raw_filename)
-                boundary_status, written = self._write_file_part(read_line, boundary_line, final_boundary, target)
+                target = self._reserve_upload_path(raw_filename)
+                try:
+                    boundary_status, written = self._write_file_part(read_line, boundary_line, final_boundary, target)
+                except Exception:
+                    target.unlink(missing_ok=True)
+                    raise
                 if written == 0:
                     target.unlink(missing_ok=True)
                 else:
@@ -790,7 +696,7 @@ class ReceiveServer:
             else:
                 boundary_status, value = self._read_text_part(read_line, boundary_line, final_boundary)
                 if field_name == "password" and self.password_required:
-                    authorized = hmac.compare_digest(value, self.password)
+                    authorized = hmac.compare_digest(value.encode(), self.password.encode())
 
             done = boundary_status == "final"
 
@@ -883,18 +789,19 @@ class ReceiveServer:
             params[name.lower()] = value
         return params
 
-    def _unique_upload_path(self, filename: str) -> Path:
+    def _reserve_upload_path(self, filename: str) -> Path:
         safe_name = self._safe_filename(filename)
         candidate = self.save_dir / safe_name
-        if not candidate.exists():
-            return candidate
-
         stem = candidate.stem
         suffix = candidate.suffix
-        for index in range(1, 10000):
-            candidate = self.save_dir / f"{stem} ({index}){suffix}"
-            if not candidate.exists():
+        for index in range(10000):
+            if index:
+                candidate = self.save_dir / f"{stem} ({index}){suffix}"
+            try:
+                candidate.touch(exist_ok=False)
                 return candidate
+            except FileExistsError:
+                continue
         raise OSError("Could not create a unique filename.")
 
     @staticmethod
@@ -909,191 +816,35 @@ class ReceiveServer:
         return cleaned[:180]
 
     def _upload_page(self, error: str | None = None) -> str:
-        password_html = ""
-        security_note = "No password required"
-        if self.password_required:
-            security_note = "Password required"
-            password_html = """
-                <label for="password">Password</label>
-                <input id="password" name="password" type="password" autocomplete="current-password" required>
-            """
+        return mobile.upload_page(self.max_upload_bytes, self.password_required, error)
 
-        error_html = ""
-        if error:
-            error_html = f'<p class="error">{html.escape(error)}</p>'
-
-        max_size = "No fixed limit" if self.max_upload_bytes is None else html.escape(format_bytes(self.max_upload_bytes))
-        return f"""<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>NoxLab Share Upload</title>
-    <style>
-        :root {{
-            color-scheme: dark;
-            --bg: #0c0e12;
-            --panel: #171a20;
-            --text: #f2f2f2;
-            --muted: #a6aab2;
-            --red: #e53935;
-            --border: #303640;
-        }}
-        * {{ box-sizing: border-box; }}
-        body {{
-            margin: 0;
-            min-height: 100vh;
-            display: grid;
-            place-items: center;
-            background: var(--bg);
-            color: var(--text);
-            font-family: Segoe UI, Arial, sans-serif;
-            padding: 24px;
-        }}
-        main {{
-            width: min(100%, 560px);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            background: var(--panel);
-            padding: 28px;
-            box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
-        }}
-        .brand {{
-            color: var(--red);
-            font-family: Consolas, monospace;
-            font-size: 14px;
-            font-weight: 700;
-            margin-bottom: 18px;
-        }}
-        h1 {{
-            font-size: 24px;
-            line-height: 1.2;
-            margin: 0 0 12px;
-        }}
-        .muted {{
-            color: var(--muted);
-            font-size: 14px;
-            line-height: 1.5;
-        }}
-        .warning {{
-            border-left: 3px solid var(--red);
-            padding: 10px 12px;
-            background: rgba(229, 57, 53, 0.1);
-            margin: 18px 0;
-        }}
-        .error {{
-            color: #ffd2d2;
-            background: rgba(229, 57, 53, 0.18);
-            border: 1px solid rgba(229, 57, 53, 0.4);
-            padding: 10px 12px;
-            border-radius: 6px;
-        }}
-        form {{
-            display: grid;
-            gap: 12px;
-            margin-top: 18px;
-        }}
-        input {{
-            width: 100%;
-            min-height: 44px;
-            border-radius: 6px;
-            border: 1px solid var(--border);
-            background: #0f1217;
-            color: var(--text);
-            padding: 9px 10px;
-            font-size: 16px;
-        }}
-        input[type="file"] {{
-            padding: 10px;
-        }}
-        label {{
-            color: var(--muted);
-        }}
-        button {{
-            min-height: 46px;
-            border: 0;
-            border-radius: 6px;
-            background: var(--red);
-            color: white;
-            font-weight: 700;
-            font-size: 16px;
-            cursor: pointer;
-        }}
-    </style>
-</head>
-<body>
-    <main>
-        <div class="brand">NOXLAB SHARE</div>
-        <h1>Send files to this PC</h1>
-        <p class="muted">Choose one or more files from your phone. They will be saved on the sender's PC.</p>
-        <p class="warning muted">LAN only. Use this only on networks you trust. Limit: {max_size}. Security: {security_note}.</p>
-        {error_html}
-        <form method="post" action="/upload" enctype="multipart/form-data">
-            {password_html}
-            <label for="files">Files</label>
-            <input id="files" name="files" type="file" multiple required>
-            <button type="submit">Upload to PC</button>
-        </form>
-    </main>
-</body>
-</html>"""
-
-    def _success_page(self, uploaded: list[tuple[Path, int]]) -> str:
-        items = "\n".join(
-            f"<li>{html.escape(path.name)} <span>{html.escape(format_bytes(size))}</span></li>"
-            for path, size in uploaded
-        )
-        return f"""<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>NoxLab Share Upload Complete</title>
-    <style>
-        :root {{ color-scheme: dark; --bg:#0c0e12; --panel:#171a20; --text:#f2f2f2; --muted:#a6aab2; --red:#e53935; --border:#303640; }}
-        * {{ box-sizing: border-box; }}
-        body {{ margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--text); font-family:Segoe UI,Arial,sans-serif; padding:24px; }}
-        main {{ width:min(100%,560px); border:1px solid var(--border); border-radius:8px; background:var(--panel); padding:28px; }}
-        .brand {{ color:var(--red); font-family:Consolas,monospace; font-weight:700; margin-bottom:18px; }}
-        h1 {{ font-size:24px; margin:0 0 12px; }}
-        .muted, span {{ color:var(--muted); }}
-        li {{ margin:8px 0; overflow-wrap:anywhere; }}
-        a {{ color:white; background:var(--red); display:inline-flex; min-height:42px; align-items:center; padding:0 16px; border-radius:6px; text-decoration:none; font-weight:700; margin-top:18px; }}
-    </style>
-</head>
-<body>
-    <main>
-        <div class="brand">NOXLAB SHARE</div>
-        <h1>Upload complete</h1>
-        <p class="muted">Saved on the PC:</p>
-        <ul>{items}</ul>
-        <a href="/upload">Upload more</a>
-    </main>
-</body>
-</html>"""
+    @staticmethod
+    def _success_page(uploaded: list[tuple[Path, int]]) -> str:
+        return mobile.success_page(uploaded)
 
     @staticmethod
     def _not_found_page() -> str:
-        return """<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Not Found</title></head>
-<body style="font-family:Segoe UI,Arial,sans-serif;background:#0c0e12;color:#f2f2f2;padding:24px;">
-<h1>Not found</h1><p>Open /upload to send files to this PC.</p>
-</body>
-</html>"""
+        return mobile.not_found(receiving=True)
 
     @staticmethod
     def _send_html(handler: BaseHTTPRequestHandler, body: str, status: int = 200) -> None:
         payload = body.encode("utf-8")
+        ReceiveServer._respond(handler, payload, "text/html; charset=utf-8", status)
+
+    @staticmethod
+    def _respond(handler, payload, content_type, status):
         handler.send_response(status)
-        handler.send_header("Content-Type", "text/html; charset=utf-8")
+        handler.send_header("Content-Type", content_type)
         handler.send_header("Content-Length", str(len(payload)))
         handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Connection", "close")
         handler.end_headers()
         handler.wfile.write(payload)
+        handler.close_connection = True
 
     @staticmethod
     def _redirect(handler: BaseHTTPRequestHandler, location: str) -> None:
         handler.send_response(302)
         handler.send_header("Location", location)
+        handler.send_header("Content-Length", "0")
         handler.end_headers()

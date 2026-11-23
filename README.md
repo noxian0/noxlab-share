@@ -4,11 +4,19 @@ NoxLab Share is a Windows desktop/local utility for sending files from a PC to d
 
 No cloud upload. No account system. No tunneling service.
 
-## Screenshots
+## Screenshots from v1.1.0
 
-![NoxLab Share main screen](pics/main.png)
+**Send from a PC.** A shared folder is ready to download as a ZIP using the link or QR code.
 
-![NoxLab Share active share screen](pics/shared.png)
+![Send tab sharing the Field recordings folder, with its QR code and LAN link](pics/shared.png)
+
+**Receive on a PC.** The progress bar shows how much of the incoming file the PC has saved.
+
+![Receive tab showing Soundcheck.wav at 49 percent, with 6 MB received](pics/main.png)
+
+**Send from a phone.** Review the selected filenames and sizes before starting the upload.
+
+<img src="pics/mobile.png" alt="Phone upload page with an audio file and a text file selected" width="320">
 
 ## Features
 
@@ -25,8 +33,8 @@ No cloud upload. No account system. No tunneling service.
 - Receive files from a phone through a LAN upload page
 - Choose the PC folder where received files are saved
 - Choose a receive upload limit: 512 MB, 2 GB, 5 GB, 10 GB, or no fixed limit
-- Sender status shows the other device's LAN IP and time when it receives the final download byte
-- Lightweight activity log
+- Sender status shows the device's LAN IP and the time the PC finishes sending the file or final requested range
+- Separate Send, Receive and Activity tabs, with incoming file progress on the PC
 - Temporary ZIP cleanup when sharing stops or the app exits
 
 ## Stack choice
@@ -58,7 +66,7 @@ For building a Windows release:
 
 ## Download from GitHub
 
-Download `NoxLabShare-1.0.2-windows.zip` from the latest GitHub Release.
+Download the Windows ZIP from the [latest GitHub Release](https://github.com/noxian0/noxlab-share/releases/latest).
 
 The ZIP includes:
 
@@ -91,23 +99,27 @@ This creates `NoxLab Share.lnk` on your Desktop and `Open NoxLab Share.lnk` insi
 
 ## Send files from PC
 
-1. Choose **Select File** or **Select Folder**.
+1. Open **Send** and choose **Choose file** or **Choose folder**.
 2. Optionally enable a password.
 3. Choose an auto-stop timer or leave it on Manual.
 4. Click **Start Sharing**.
 5. Open the LAN URL on another device or scan the QR code.
-6. The sender app's **Last download** status shows the device IP and time when the transfer finishes.
-7. Click **Stop** when finished.
+6. **Last send** shows the device IP and time the PC finished sending the file or requested final range.
+7. Click **Stop session** when finished.
 
 ## Receive files from phone
 
-1. Choose the receive folder or keep the default `Downloads\NoxLab Share Received`.
+1. Open **Receive** and choose a folder or keep the default `Downloads\NoxLab Share Received`.
 2. Optionally enable a password.
 3. Choose an auto-stop timer or leave it on Manual.
-4. Click **Start Receiving From Phone**.
+4. Click **Start receiving**.
 5. Scan the QR code with the phone.
-6. Choose one or more files on the phone upload page.
-7. Click **Stop** when finished.
+6. Choose one or more files on the phone. Check their names and sizes, then tap **Upload to PC**.
+7. Wait for **Saved on PC**, then click **Stop session**.
+
+With the upload page open, the browser reads each selected file in 2 MiB pieces. The percentage advances when the PC confirms a piece. After a connection drop, **Retry upload** continues from the last confirmed piece while the same receive session and page are open. The PC discards incomplete transfers after 15 minutes of inactivity or when receiving stops. Wait for **Saved on PC** before closing the page.
+
+If the browser reports that it cannot read the video, choose a locally stored copy through Android's **Files** picker. The PC activity log shows the start and completion of each file.
 
 ## LAN and firewall notes
 
@@ -135,7 +147,9 @@ If another device cannot open the link:
 ```text
 noxlab_share/
   __main__.py       App entrypoint
-  app.py            Tkinter desktop UI
+  app.py            Desktop session controls
+  desktop_ui.py     Send, Receive and Activity views
+  mobile.py         Mobile transfer pages
   server.py         Local HTTP server and download page
   qr_tools.py       QR generation and clipboard helpers
   utils.py          LAN IP, ZIP, size, and cleanup utilities
@@ -170,13 +184,13 @@ pip install pyinstaller
 Build the standalone app and portable ZIP:
 
 ```powershell
-.\scripts\package_release.ps1 -Version 1.0.2
+.\scripts\package_release.ps1
 ```
 
 Outputs:
 
 - `dist\NoxLab Share.exe` standalone app
-- `release\NoxLabShare-1.0.2-windows.zip` portable release
+- `release\NoxLabShare-1.1.0-windows.zip` portable release
 
 The portable ZIP includes `Install.cmd`, which copies the app to:
 
@@ -189,7 +203,7 @@ It also creates Desktop, Start Menu, and in-folder shortcuts.
 To build the unsigned setup EXE for local testing, pass `-BuildSetup`:
 
 ```powershell
-.\scripts\package_release.ps1 -Version 1.0.2 -BuildSetup
+.\scripts\package_release.ps1 -BuildSetup
 ```
 
 Do not publish the unsigned setup EXE unless you expect browser or antivirus warnings.
@@ -206,7 +220,7 @@ The main local validation path is:
 6. Stop sharing and confirm the app log reports the server stopped.
 
 Folder sharing is validated the same way, except the selected folder is served as a temporary ZIP.
-Receive mode can be validated by starting **Start Receiving From Phone**, opening the `/upload` page from a phone, and sending a small test file.
+Receive mode can be validated by opening **Receive**, clicking **Start receiving**, opening the `/upload` page on a phone, and sending a small test file.
 
 You can also run the server smoke test without opening the desktop UI:
 
